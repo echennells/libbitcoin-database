@@ -775,6 +775,81 @@ BOOST_AUTO_TEST_CASE(query_chain_writer__set_block_txs__get_block__expected)
     BOOST_CHECK_EQUAL(hashes, test::genesis.transaction_hashes(false));
 }
 
+// allocate transacted
+// ----------------------------------------------------------------------------
+
+static shared_timed_mutex* watched{};
+static bool transacted{};
+
+// Clears transacted upon any allocation made without the transactor held.
+template <size_t... Widths>
+class transacted_storages
+  : public test::chunk_storages<Widths...>
+{
+public:
+    using base = test::chunk_storages<Widths...>;
+    using base::base;
+    using base::allocate;
+
+    size_t allocate(size_t count) NOEXCEPT override
+    {
+        if (!is_null(watched) && watched->try_lock())
+        {
+            watched->unlock();
+            transacted = false;
+        }
+
+        return base::allocate(count);
+    }
+};
+
+class transacted_store
+  : public store<transacted_storages>
+{
+public:
+    using store<transacted_storages>::store;
+
+    shared_timed_mutex& transactor_mutex() NOEXCEPT
+    {
+        return transactor_mutex_;
+    }
+};
+
+BOOST_AUTO_TEST_CASE(query_chain_writer__set_tx__allocate__transacted)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    transacted_store store{ settings };
+    query<database::store<transacted_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    transacted = true;
+    watched = &store.transactor_mutex();
+    const auto success = query.set(test::tx4);
+    watched = nullptr;
+    BOOST_REQUIRE(success);
+    BOOST_REQUIRE(transacted);
+}
+
+BOOST_AUTO_TEST_CASE(query_chain_writer__set_block__allocate__transacted)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    transacted_store store{ settings };
+    query<database::store<transacted_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    transacted = true;
+    watched = &store.transactor_mutex();
+    const auto success = query.set(test::block1a, test::context, {}, false,
+        false);
+    watched = nullptr;
+    BOOST_REQUIRE(success);
+    BOOST_REQUIRE(transacted);
+}
+
 // populate_with_metadata
 // ----------------------------------------------------------------------------
 
