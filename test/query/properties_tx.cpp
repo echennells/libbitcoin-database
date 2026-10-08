@@ -402,4 +402,200 @@ BOOST_AUTO_TEST_CASE(query_properties_tx__get_compact_links__disabled__terminal)
     BOOST_REQUIRE_EQUAL(out.at(0), tx_link::terminal);
 }
 
+// get_compact_links (concurrent pool size)
+
+// Hides the last row from size() reads numbered below after, or at or above
+// until. The scan reads its four id column guards (0-3), then count (4), then
+// one key per matched row, simulating allocation (after) or truncation (until).
+template <size_t... Widths>
+class hiding_storages
+  : public test::chunk_storages<Widths...>
+{
+public:
+    using base = test::chunk_storages<Widths...>;
+    using base::base;
+
+    size_t size() const NOEXCEPT override
+    {
+        const auto logical = base::size();
+        const auto read = reads_++;
+        if (is_zero(logical) || ((read >= after_) && (read < until_)))
+            return logical;
+
+        return sub1(logical);
+    }
+
+    void hide_last_row(size_t after, size_t until) NOEXCEPT
+    {
+        reads_ = zero;
+        after_ = after;
+        until_ = until;
+    }
+
+private:
+    mutable size_t reads_{};
+    size_t after_{};
+    size_t until_{ max_size_t };
+};
+
+class hiding_store
+  : public store<hiding_storages>
+{
+public:
+    using store<hiding_storages>::store;
+
+    void hide_pool_row(size_t after, size_t until) NOEXCEPT
+    {
+        pool_body_.hide_last_row(after, until);
+    }
+};
+
+BOOST_AUTO_TEST_CASE(query_properties_tx__get_compact_links__allocated_between_guards__expected)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    hiding_store store{ settings };
+    query<database::store<hiding_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const transaction tx4{ test::tx4.to_data(true), true };
+    const transaction tx5{ test::tx5.to_data(true), true };
+    tx4.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+    tx4.inputs_ptr()->at(1)->metadata.parent_tx = 42;
+    tx5.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+
+    tx_link link4{};
+    tx_link link5{};
+    BOOST_REQUIRE(!query.set_code(link4, tx4));
+    BOOST_REQUIRE(!query.set_code(link5, tx5));
+    BOOST_REQUIRE(query.set_pooled(link4, tx4, context{ bip113, 8, 9 }));
+    BOOST_REQUIRE(query.set_pooled(link5, tx5, context{ bip113, 8, 9 }));
+    store.hide_pool_row(1u, max_size_t);
+
+    tx_links out{};
+    const std::vector<uint64_t> ids{ to_short_id(tx4), to_short_id(tx5) };
+    BOOST_REQUIRE_EQUAL(query.get_compact_links(out, ids, compact_key), error::success);
+    BOOST_REQUIRE_EQUAL(out.size(), 2u);
+    BOOST_REQUIRE_EQUAL(out.at(0), link4);
+    BOOST_REQUIRE_EQUAL(out.at(1), tx_link::terminal);
+}
+
+BOOST_AUTO_TEST_CASE(query_properties_tx__get_compact_links__allocated_before_count__expected)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    hiding_store store{ settings };
+    query<database::store<hiding_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const transaction tx4{ test::tx4.to_data(true), true };
+    const transaction tx5{ test::tx5.to_data(true), true };
+    tx4.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+    tx4.inputs_ptr()->at(1)->metadata.parent_tx = 42;
+    tx5.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+
+    tx_link link4{};
+    tx_link link5{};
+    BOOST_REQUIRE(!query.set_code(link4, tx4));
+    BOOST_REQUIRE(!query.set_code(link5, tx5));
+    BOOST_REQUIRE(query.set_pooled(link4, tx4, context{ bip113, 8, 9 }));
+    BOOST_REQUIRE(query.set_pooled(link5, tx5, context{ bip113, 8, 9 }));
+    store.hide_pool_row(4u, max_size_t);
+
+    tx_links out{};
+    const std::vector<uint64_t> ids{ to_short_id(tx4), to_short_id(tx5) };
+    BOOST_REQUIRE_EQUAL(query.get_compact_links(out, ids, compact_key), error::success);
+    BOOST_REQUIRE_EQUAL(out.size(), 2u);
+    BOOST_REQUIRE_EQUAL(out.at(0), link4);
+    BOOST_REQUIRE_EQUAL(out.at(1), tx_link::terminal);
+}
+
+BOOST_AUTO_TEST_CASE(query_properties_tx__get_compact_links__allocated_after_count__expected)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    hiding_store store{ settings };
+    query<database::store<hiding_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const transaction tx4{ test::tx4.to_data(true), true };
+    const transaction tx5{ test::tx5.to_data(true), true };
+    tx4.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+    tx4.inputs_ptr()->at(1)->metadata.parent_tx = 42;
+    tx5.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+
+    tx_link link4{};
+    tx_link link5{};
+    BOOST_REQUIRE(!query.set_code(link4, tx4));
+    BOOST_REQUIRE(!query.set_code(link5, tx5));
+    BOOST_REQUIRE(query.set_pooled(link4, tx4, context{ bip113, 8, 9 }));
+    BOOST_REQUIRE(query.set_pooled(link5, tx5, context{ bip113, 8, 9 }));
+    store.hide_pool_row(max_size_t, max_size_t);
+
+    tx_links out{};
+    const std::vector<uint64_t> ids{ to_short_id(tx4), to_short_id(tx5) };
+    BOOST_REQUIRE_EQUAL(query.get_compact_links(out, ids, compact_key), error::success);
+    BOOST_REQUIRE_EQUAL(out.size(), 2u);
+    BOOST_REQUIRE_EQUAL(out.at(0), link4);
+    BOOST_REQUIRE_EQUAL(out.at(1), tx_link::terminal);
+}
+
+BOOST_AUTO_TEST_CASE(query_properties_tx__get_compact_links__truncated_before_count__expected)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    hiding_store store{ settings };
+    query<database::store<hiding_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const transaction tx4{ test::tx4.to_data(true), true };
+    const transaction tx5{ test::tx5.to_data(true), true };
+    tx4.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+    tx4.inputs_ptr()->at(1)->metadata.parent_tx = 42;
+    tx5.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+
+    tx_link link4{};
+    tx_link link5{};
+    BOOST_REQUIRE(!query.set_code(link4, tx4));
+    BOOST_REQUIRE(!query.set_code(link5, tx5));
+    BOOST_REQUIRE(query.set_pooled(link4, tx4, context{ bip113, 8, 9 }));
+    BOOST_REQUIRE(query.set_pooled(link5, tx5, context{ bip113, 8, 9 }));
+    store.hide_pool_row(zero, 4u);
+
+    tx_links out{};
+    const std::vector<uint64_t> ids{ to_short_id(tx4), to_short_id(tx5) };
+    BOOST_REQUIRE_EQUAL(query.get_compact_links(out, ids, compact_key), error::success);
+    BOOST_REQUIRE_EQUAL(out.size(), 2u);
+    BOOST_REQUIRE_EQUAL(out.at(0), link4);
+    BOOST_REQUIRE_EQUAL(out.at(1), tx_link::terminal);
+}
+
+BOOST_AUTO_TEST_CASE(query_properties_tx__get_compact_links__only_row_allocated_before_count__terminal)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    hiding_store store{ settings };
+    query<database::store<hiding_storages>> query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const transaction tx5{ test::tx5.to_data(true), true };
+    tx5.inputs_ptr()->at(0)->metadata.parent_tx = 42;
+
+    tx_link link5{};
+    BOOST_REQUIRE(!query.set_code(link5, tx5));
+    BOOST_REQUIRE(query.set_pooled(link5, tx5, context{ bip113, 8, 9 }));
+    store.hide_pool_row(4u, max_size_t);
+
+    tx_links out{};
+    const std::vector<uint64_t> ids{ to_short_id(tx5) };
+    BOOST_REQUIRE_EQUAL(query.get_compact_links(out, ids, compact_key), error::success);
+    BOOST_REQUIRE_EQUAL(out.size(), 1u);
+    BOOST_REQUIRE_EQUAL(out.at(0), tx_link::terminal);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

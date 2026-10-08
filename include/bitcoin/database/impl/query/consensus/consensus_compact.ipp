@@ -92,11 +92,12 @@ bool CLASS::get_compact_matches(compact_matches& out,
     if (!ptr0 || !ptr1 || !ptr2 || !ptr3)
         return false;
 
-    const auto rows = possible_narrow_cast<size_t>(store_.pool.count().value);
-    const auto bytes = rows * sizeof(lane_t);
-    if (is_lesser(ptr0.size(), bytes) || is_lesser(ptr1.size(), bytes) ||
-        is_lesser(ptr2.size(), bytes) || is_lesser(ptr3.size(), bytes))
-        return false;
+    // Logical size may change across these reads, so scan the shortest.
+    const auto count = possible_narrow_cast<size_t>(store_.pool.count().value);
+    const auto bytes = std::min({ ptr0.size(), ptr1.size(), ptr2.size(),
+        ptr3.size() });
+    const auto rows = std::min(count,
+        possible_narrow_sign_cast<size_t>(bytes) / sizeof(lane_t));
 
     const auto chunk_rows = std::max(short_id_minimum_rows,
         ceilinged_divide(rows, two * cores()));
