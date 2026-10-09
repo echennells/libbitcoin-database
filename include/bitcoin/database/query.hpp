@@ -1050,6 +1050,7 @@ protected:
     /// Writers
     /// -----------------------------------------------------------------------
 
+    /// Set tx into allocated tx row, caller must hold transactor.
     code set_code(const tx_link& tx_fk, const transaction& tx,
         bool bypass, bool prune) NOEXCEPT;
 
