@@ -164,6 +164,7 @@ BOOST_AUTO_TEST_CASE(query_extent__optionals_enabled__default__true)
     BOOST_REQUIRE(query.initialize(test::genesis));
     BOOST_REQUIRE(query.address_enabled());
     BOOST_REQUIRE(query.filter_enabled());
+    BOOST_REQUIRE(query.pool_enabled());
 }
 
 BOOST_AUTO_TEST_CASE(query_extent__address_enabled__disabled__false)
@@ -190,6 +191,20 @@ BOOST_AUTO_TEST_CASE(query_extent__filter_enabled__disabled__false)
     BOOST_REQUIRE(query.initialize(test::genesis));
     BOOST_REQUIRE(query.address_enabled());
     BOOST_REQUIRE(!query.filter_enabled());
+}
+
+BOOST_AUTO_TEST_CASE(query_extent__pool_enabled__disabled__false)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    settings.pool.buckets = 0;
+    test::chunk_store store{ settings };
+    test::query_accessor query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+    BOOST_REQUIRE(query.address_enabled());
+    BOOST_REQUIRE(query.filter_enabled());
+    BOOST_REQUIRE(!query.pool_enabled());
 }
 
 // aggregate sizes

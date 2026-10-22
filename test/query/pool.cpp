@@ -400,6 +400,164 @@ BOOST_AUTO_TEST_CASE(query_pool__is_confirmable_tx__conflicted_and_child__false)
     BOOST_REQUIRE(!query.is_confirmable_tx(query.to_tx(child.hash(false))));
 }
 
+// get_confirmables
+
+class query_access
+  : public test::query_accessor
+{
+public:
+    using base = test::query_accessor;
+    using base::base;
+    using base::get_confirmables;
+    using base::is_confirmable_tx;
+};
+
+static transaction to_spend(const system::hash_digest& hash, uint32_t index, uint64_t value) NOEXCEPT
+{
+    const input input{ point{ hash, index }, script{}, max_uint32 };
+    return { 1u, inputs{ input }, outputs{ output{ value, script{} } }, 0u };
+}
+
+static transaction to_fan(const system::hash_digest& hash, size_t count) NOEXCEPT
+{
+    const input input{ point{ hash, 0 }, script{}, max_uint32 };
+    return { 1u, inputs{ input }, outputs(count, output{ 1u, script{} }), 0u };
+}
+
+// Archive a block of a coinbase and the tx above genesis, not confirmed.
+static bool archive_block(test::query_accessor& query, const transaction& tx) NOEXCEPT
+{
+    const input null{ point{ system::null_hash, point::null_index }, script{}, max_uint32 };
+    const transaction coinbase{ 1u, inputs{ null }, outputs{ output{ 43u, script{} } }, 0u };
+    const header header{ 1u, test::genesis.hash(), system::null_hash, 1u, 2u, 4u };
+    return query.set(block{ header, { coinbase, tx } }, context{ 0, 1, 0 }, {}, false, false);
+}
+
+BOOST_AUTO_TEST_CASE(query_pool__get_confirmables__live_fanout__ancestry_true)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    query_access query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const auto root = to_spend(genesis_coinbase(), 3u);
+    const auto middle = to_spend(root.hash(false), 3u);
+    const auto fan = to_fan(middle.hash(false), 3u);
+    const auto first = to_spend(fan.hash(false), 0, 1u);
+    const auto second = to_spend(fan.hash(false), 1, 1u);
+    const auto third = to_spend(fan.hash(false), 2, 1u);
+    BOOST_REQUIRE(archive_pool(query, root));
+    BOOST_REQUIRE(archive_pool(query, middle));
+    BOOST_REQUIRE(archive_pool(query, fan));
+    BOOST_REQUIRE(archive_pool(query, first));
+    BOOST_REQUIRE(archive_pool(query, second));
+    BOOST_REQUIRE(archive_pool(query, third));
+
+    confirmables memo{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_confirmables(cancel, memo, { query.to_tx(first.hash(false)).value, query.to_tx(second.hash(false)).value, query.to_tx(third.hash(false)).value }));
+    BOOST_REQUIRE_EQUAL(memo.size(), 6u);
+    BOOST_REQUIRE(memo.contains(query.to_tx(root.hash(false)).value));
+    BOOST_REQUIRE(memo.contains(query.to_tx(middle.hash(false)).value));
+    BOOST_REQUIRE(memo.contains(query.to_tx(fan.hash(false)).value));
+    BOOST_REQUIRE(std::all_of(memo.begin(), memo.end(), [](const auto& entry) NOEXCEPT { return entry.second; }));
+}
+
+BOOST_AUTO_TEST_CASE(query_pool__get_confirmables__dead_fanout__ancestry_false)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    query_access query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const auto root = to_spend(genesis_coinbase(), 3u);
+    const auto middle = to_spend(root.hash(false), 3u);
+    const auto fan = to_fan(middle.hash(false), 3u);
+    const auto first = to_spend(fan.hash(false), 0, 1u);
+    const auto second = to_spend(fan.hash(false), 1, 1u);
+    const auto third = to_spend(fan.hash(false), 2, 1u);
+    BOOST_REQUIRE(archive_pool(query, root));
+    BOOST_REQUIRE(archive_pool(query, middle));
+    BOOST_REQUIRE(archive_pool(query, fan));
+    BOOST_REQUIRE(archive_pool(query, first));
+    BOOST_REQUIRE(archive_pool(query, second));
+    BOOST_REQUIRE(archive_pool(query, third));
+    BOOST_REQUIRE(!archive_confirm(query, to_spend(genesis_coinbase(), 1u)).is_terminal());
+
+    // Each unlisted ancestor is memoized (so evaluated once), not only the txs.
+    confirmables memo{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_confirmables(cancel, memo, { query.to_tx(first.hash(false)).value, query.to_tx(second.hash(false)).value, query.to_tx(third.hash(false)).value }));
+    BOOST_REQUIRE_EQUAL(memo.size(), 6u);
+    BOOST_REQUIRE(memo.contains(query.to_tx(root.hash(false)).value));
+    BOOST_REQUIRE(memo.contains(query.to_tx(middle.hash(false)).value));
+    BOOST_REQUIRE(memo.contains(query.to_tx(fan.hash(false)).value));
+    BOOST_REQUIRE(std::none_of(memo.begin(), memo.end(), [](const auto& entry) NOEXCEPT { return entry.second; }));
+
+    // A later evaluation of a tx is answered by the memo.
+    BOOST_REQUIRE(!query.is_confirmable_tx(memo, query.to_tx(first.hash(false))));
+    BOOST_REQUIRE(!query.is_confirmable_tx(memo, query.to_tx(second.hash(false))));
+    BOOST_REQUIRE(!query.is_confirmable_tx(memo, query.to_tx(third.hash(false))));
+    BOOST_REQUIRE_EQUAL(memo.size(), 6u);
+}
+
+BOOST_AUTO_TEST_CASE(query_pool__get_confirmables__parent_after_child__expected)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    query_access query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    // The parent resolves to its block instance, archived after the child.
+    const auto parent = to_spend(genesis_coinbase(), 2u);
+    const auto child = to_spend(parent.hash(false), 1u);
+    BOOST_REQUIRE(archive_pool(query, parent));
+    BOOST_REQUIRE(archive_pool(query, child));
+    BOOST_REQUIRE(archive_block(query, parent));
+
+    const auto parent_link = query.to_tx(parent.hash(false));
+    const auto child_link = query.to_tx(child.hash(false));
+    BOOST_REQUIRE_GT(parent_link.value, child_link.value);
+
+    confirmables live{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_confirmables(cancel, live, { child_link.value }));
+    BOOST_REQUIRE_EQUAL(live.size(), 2u);
+    BOOST_REQUIRE(live.at(parent_link.value));
+    BOOST_REQUIRE(live.at(child_link.value));
+
+    BOOST_REQUIRE(!archive_confirm(query, to_spend(genesis_coinbase(), 1u)).is_terminal());
+
+    confirmables dead{};
+    BOOST_REQUIRE(query.get_confirmables(cancel, dead, { child_link.value }));
+    BOOST_REQUIRE_EQUAL(dead.size(), 2u);
+    BOOST_REQUIRE(!dead.at(parent_link.value));
+    BOOST_REQUIRE(!dead.at(child_link.value));
+}
+
+BOOST_AUTO_TEST_CASE(query_pool__get_confirmables__canceled__false)
+{
+    settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    query_access query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const auto tx = to_spend(genesis_coinbase(), 1u);
+    BOOST_REQUIRE(archive_pool(query, tx));
+
+    confirmables memo{};
+    const stopper cancel{ true };
+    BOOST_REQUIRE(!query.get_confirmables(cancel, memo, { query.to_tx(tx.hash(false)).value }));
+}
+
 // get_confirmable_txs
 
 BOOST_AUTO_TEST_CASE(query_pool__get_confirmable_txs__empty__end)
