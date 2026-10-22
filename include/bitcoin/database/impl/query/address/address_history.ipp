@@ -32,6 +32,7 @@ namespace database {
 // root txs (height:zero) sorted before transitive (height:max) txs.
 // tied-height transactions sorted by base16 txid (not converted).
 // All confirmed txs are root, unconfirmed may or may not be root.
+// Unconfirmed txs are those pooled and confirmable.
 
 // server/electrum
 TEMPLATE
@@ -43,16 +44,23 @@ code CLASS::get_unconfirmed_history(const stopper& cancel, histories& out,
         return ec;
 
     // There is no cursor for unconfirmed, since it's height-based.
+    const auto functor = [this](const auto& link, auto& cancel,
+        auto& fail) NOEXCEPT
+    {
+        if (cancel || fail) return history{};
+        const auto out = this->get_tx_unconfirmed_history(
+            this->get_tx_key(link), link);
+        if (out.fault()) fail = true;
+        return out;
+    };
+
     out.clear();
     out.resize(txs.size());
-    return parallel_history_transform(cancel, turbo, out, txs,
-        [this](const auto& link, auto& cancel, auto& fail) NOEXCEPT
-        {
-            if (cancel || fail) return history{};
-            const auto out = this->get_tx_unconfirmed_history(link);
-            if (out.fault()) fail = true;
-            return out;
-        });
+    if (const auto ec = parallel_history_transform(cancel, turbo, out, txs,
+        functor))
+        return ec;
+
+    return filter_unconfirmable(cancel, out);
 }
 
 // ununsed
@@ -99,16 +107,23 @@ code CLASS::get_history(const stopper& cancel, height_link& cursor,
     const auto end = get_top_confirmed();
     cursor = system::possible_narrow_cast<height_link::integer>(add1(end));
 
+    const auto functor = [this, start, end](const auto& link, auto& cancel,
+        auto& fail) NOEXCEPT
+    {
+        if (cancel || fail) return history{};
+        const auto out = this->get_tx_history(this->get_tx_key(link), link,
+            start, end);
+        if (out.fault()) fail = true;
+        return out;
+    };
+
     out.clear();
     out.resize(txs.size());
-    return parallel_history_transform(cancel, turbo, out, txs,
-        [this, start, end](const auto& link, auto& cancel, auto& fail) NOEXCEPT
-        {
-            if (cancel || fail) return history{};
-            const auto out = this->get_tx_history(link, start, end);
-            if (out.fault()) fail = true;
-            return out;
-        });
+    if (const auto ec = parallel_history_transform(cancel, turbo, out, txs,
+        functor))
+        return ec;
+
+    return filter_unconfirmable(cancel, out);
 }
 
 // get_tx_history
@@ -118,7 +133,13 @@ TEMPLATE
 history CLASS::get_tx_history(const tx_link& link, size_t start,
     size_t end) const NOEXCEPT
 {
-    return get_tx_history(get_tx_key(link), link, start, end);
+    const auto out = get_tx_history(get_tx_key(link), link, start, end);
+
+    // Invalid with unconfirmed_position signals no fault.
+    if (out.valid() && !out.confirmed() && !is_confirmable_tx(link))
+        return { .position = history::unconfirmed_position };
+
+    return out;
 }
 
 // protected
@@ -140,6 +161,10 @@ history CLASS::get_tx_history(hash_digest&& key, const tx_link& link,
     const auto at = get_confirmed_height(block);
     if (at.is_terminal())
     {
+        // Invalid with unconfirmed_position signals no fault.
+        if (!is_pooled(link))
+            return { .position = history::unconfirmed_position };
+
         if (!get_tx_fee(fee, link))
             fee = history::missing_prevout;
 
@@ -196,7 +221,13 @@ history CLASS::get_tx_confirmed_history(hash_digest&& key, const tx_link& link,
 TEMPLATE
 history CLASS::get_tx_unconfirmed_history(const tx_link& link) const NOEXCEPT
 {
-    return get_tx_unconfirmed_history(get_tx_key(link), link);
+    const auto out = get_tx_unconfirmed_history(get_tx_key(link), link);
+
+    // Invalid with unconfirmed_position signals no fault.
+    if (out.valid() && !is_confirmable_tx(link))
+        return { .position = history::unconfirmed_position };
+
+    return out;
 }
 
 // protected
@@ -209,7 +240,8 @@ history CLASS::get_tx_unconfirmed_history(hash_digest&& key,
         return {};
 
     // Invalid with unconfirmed_position signals no fault.
-    if (!get_confirmed_height(find_strong(link)).is_terminal())
+    if (!get_confirmed_height(find_strong(link)).is_terminal() ||
+        !is_pooled(link))
         return { .position = history::unconfirmed_position };
 
     uint64_t fee{};
@@ -234,9 +266,17 @@ histories CLASS::get_spenders_history(
     histories out{};
     out.reserve(ins.size());
     for (const auto& in: std::views::reverse(ins))
-        out.push_back(get_tx_history(to_input_tx(in)));
+    {
+        const auto link = to_input_tx(in);
+        out.push_back(get_tx_history(get_tx_key(link), link, zero,
+            max_size_t));
+    }
 
     history::filter_sort_and_dedup(out);
+
+    // Confirmability is memoized across the spenders (cannot cancel).
+    const stopper cancel{};
+    filter_unconfirmable(cancel, out);
     return out;
 }
 
@@ -249,6 +289,29 @@ histories CLASS::get_spenders_history(const hash_digest& key,
 
 // utilities
 // ----------------------------------------------------------------------------
+
+// protected
+TEMPLATE
+code CLASS::filter_unconfirmable(const stopper& cancel,
+    histories& out) const NOEXCEPT
+{
+    tx_links links{};
+    for (const auto& element: out)
+        if (!element.confirmed())
+            links.push_back(to_tx(element.tx.hash()).value);
+
+    confirmables memo{};
+    if (!get_confirmables(cancel, memo, std::move(links)))
+        return error::query_canceled;
+
+    std::erase_if(out, [&](const history& element) NOEXCEPT
+    {
+        return !element.confirmed() &&
+            !is_confirmable_tx(memo, to_tx(element.tx.hash()));
+    });
+
+    return error::success;
+}
 
 TEMPLATE
 code CLASS::get_address_txs(const stopper& cancel, tx_links& out,

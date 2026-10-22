@@ -30,7 +30,8 @@ namespace database {
 // Address table is populated during transaction archival.
 
 // server/native
-// Only unconfirmed outputs that are not spent (by an unconfirmed tx).
+// Only unconfirmed (pooled and confirmable) outputs that are not spent (by a
+// pooled and confirmable tx).
 TEMPLATE
 code CLASS::get_unconfirmed_unspent_outpoints(const stopper& cancel,
     outpoints& out, const hash_digest& key, bool turbo) const NOEXCEPT
@@ -40,20 +41,26 @@ code CLASS::get_unconfirmed_unspent_outpoints(const stopper& cancel,
     if (const code ec = to_address_outputs(cancel, links, key))
         return ec;
 
-    return parallel_outpoint_transform(cancel, turbo, out, links,
-        [this](const output_link& link, auto& cancel, auto& fail) NOEXCEPT
-        {
-            // Confirmed and spent must be filtered out. An unconfirmed output
-            // can only be spent by an unconfirmed tx, so is_spent() suffices.
-            if (cancel || fail || is_confirmed_output(link) || is_spent(link))
-                return outpoint{};
+    const auto functor = [this](const output_link& link, auto& cancel,
+        auto& fail) NOEXCEPT
+    {
+        // Exclude if confirmed or unpooled (spenders are filtered after).
+        if (cancel || fail || is_confirmed_output(link) ||
+            !is_pooled(to_output_tx(link)))
+            return outpoint{};
 
-            const auto point = get_outpoint(link);
-            if (!point.point().is_valid())
-                fail = true;
+        const auto point = get_outpoint(link);
+        if (!point.point().is_valid())
+            fail = true;
 
-            return point;
-        });
+        return point;
+    };
+
+    if (const auto ec = parallel_outpoint_transform(cancel, turbo, out, links,
+        functor))
+        return ec;
+
+    return filter_unconfirmable(cancel, out);
 }
 
 // server/native
@@ -144,6 +151,36 @@ code CLASS::get_address_outpoints(const stopper& cancel, outpoints& out,
 
 // utilities
 // ----------------------------------------------------------------------------
+
+// protected
+TEMPLATE
+code CLASS::filter_unconfirmable(const stopper& cancel,
+    outpoints& out) const NOEXCEPT
+{
+    tx_links links{};
+    for (const auto& element: out)
+    {
+        links.push_back(to_tx(element.point().hash()).value);
+        for (const auto& in: to_spenders(element.point()))
+            if (const auto tx = to_input_tx(in); is_pooled(tx))
+                links.push_back(tx.value);
+    }
+
+    confirmables memo{};
+    if (!get_confirmables(cancel, memo, std::move(links)))
+        return error::query_canceled;
+
+    // An unconfirmed output can only be spent by an unconfirmed tx.
+    std::erase_if(out, [&](const outpoint& element) NOEXCEPT
+    {
+        const auto& point = element.point();
+        return !is_confirmable_tx(memo, to_tx(point.hash())) ||
+            !find_confirmable_spender(memo, point).is_terminal();
+    });
+
+    return error::success;
+}
+
 // private/static
 
 TEMPLATE
