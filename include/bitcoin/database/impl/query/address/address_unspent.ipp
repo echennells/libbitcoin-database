@@ -83,7 +83,8 @@ code CLASS::get_confirmed_unspent(const stopper& cancel, unspent_outputs& out,
 }
 
 // server/electrum
-// All outputs that are not spent by any tx (confirmed or unconfirmed).
+// Confirmed and unconfirmed (pooled and confirmable) outputs that are not spent
+// by a confirmed or unconfirmed tx.
 TEMPLATE
 code CLASS::get_unspent(const stopper& cancel, unspent_outputs& out,
     const hash_digest& key, bool turbo) const NOEXCEPT
@@ -92,19 +93,25 @@ code CLASS::get_unspent(const stopper& cancel, unspent_outputs& out,
     if (const auto ec = to_address_outputs(cancel, outs, key))
         return ec;
 
+    const auto functor = [this](const output_link& link, auto& cancel,
+        auto& fail) NOEXCEPT
+    {
+        // Exclude if spent by a confirmed tx (unconfirmed are filtered after).
+        if (cancel || fail || is_confirmed_spent(link))
+            return unspent_output{};
+
+        auto out = get_tx_unspent(link);
+        if (out.fault()) fail = true;
+        return out;
+    };
+
     out.clear();
     out.resize(outs.size());
-    return parallel_unspent_transform(cancel, turbo, out, outs,
-        [this](const output_link& link, auto& cancel, auto& fail) NOEXCEPT
-        {
-            // Exclude if spent by any tx, confirmed or unconfirmed.
-            if (cancel || fail || is_spent(link))
-                return unspent_output{};
+    if (const auto ec = parallel_unspent_transform(cancel, turbo, out, outs,
+        functor))
+        return ec;
 
-            auto out = get_tx_unspent(link);
-            if (out.fault()) fail = true;
-            return out;
-        });
+    return filter_unconfirmable(cancel, out, turbo);
 }
 
 // Unspent queries.
@@ -134,6 +141,11 @@ unspent_output CLASS::get_tx_unspent(const output_link& link) const NOEXCEPT
         height = at.value;
         if (!get_tx_position(position, strong, block))
             return {};
+    }
+    else if (!is_pooled(tx))
+    {
+        // Invalid with unconfirmed_position signals no fault.
+        return { .position = unspent_output::unconfirmed_position };
     }
 
     return { { { std::move(hash), index }, out.value }, height, position };
@@ -191,6 +203,70 @@ unspent_output CLASS::get_tx_unconfirmed_unspent(const output_link& link) const 
 
 // utilities
 // ----------------------------------------------------------------------------
+
+// protected
+TEMPLATE
+code CLASS::filter_unconfirmable(const stopper& cancel, unspent_outputs& out,
+    bool turbo) const NOEXCEPT
+{
+    const auto policy = poolstl::execution::par_if(turbo, parallel_floor);
+
+    // Each output resolves to its pooled spending txs (aligned with out).
+    std::vector<tx_links> spenders(out.size());
+    std::transform(policy, out.cbegin(), out.cend(), spenders.begin(),
+        [this, &cancel](const unspent_output& element) NOEXCEPT
+        {
+            tx_links txs{};
+            if (cancel)
+                return txs;
+
+            for (const auto& in: to_spenders(element.out.point()))
+                if (const auto tx = to_input_tx(in); is_pooled(tx))
+                    txs.push_back(tx.value);
+
+            return txs;
+        });
+
+    if (cancel)
+        return error::query_canceled;
+
+    tx_links links{};
+    for (size_t index{}; index < out.size(); ++index)
+    {
+        const auto& element = out.at(index);
+        if (!element.confirmed())
+            links.push_back(to_tx(element.out.point().hash()).value);
+
+        const auto& txs = spenders.at(index);
+        links.insert(links.end(), txs.cbegin(), txs.cend());
+    }
+
+    confirmables memo{};
+    if (!get_confirmables(cancel, memo, std::move(links)))
+        return error::query_canceled;
+
+    const auto confirmable = [&](const tx_link& link) NOEXCEPT
+    {
+        return is_confirmable_tx(memo, link);
+    };
+
+    // Kept by index, as spenders are aligned with out.
+    unspent_outputs kept{};
+    kept.reserve(out.size());
+    for (size_t index{}; index < out.size(); ++index)
+    {
+        auto& element = out.at(index);
+        const auto& txs = spenders.at(index);
+        if ((element.confirmed() ||
+            confirmable(to_tx(element.out.point().hash()))) &&
+            std::none_of(txs.cbegin(), txs.cend(), confirmable))
+            kept.push_back(std::move(element));
+    }
+
+    out = std::move(kept);
+    return error::success;
+}
+
 // private/static
 
 TEMPLATE

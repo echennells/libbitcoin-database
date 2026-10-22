@@ -843,6 +843,129 @@ BOOST_AUTO_TEST_CASE(query_batch_silent__get_silent_matches__time_cut__expected)
     BOOST_REQUIRE(excluded.empty());
 }
 
+static chain::transaction to_spend(const hash_digest& hash, uint64_t value) NOEXCEPT
+{
+    const chain::input input{ chain::point{ hash, 0 }, chain::script{}, max_uint32 };
+    return { 1u, chain::inputs{ input }, chain::outputs{ chain::output{ value, chain::script{} } }, 0u };
+}
+
+// Confirm a block of a coinbase and the tx above genesis, returning its link.
+static header_link archive_confirm(test::query_accessor& query, const chain::transaction& tx) NOEXCEPT
+{
+    const chain::input null{ chain::point{ null_hash, chain::point::null_index }, chain::script{}, max_uint32 };
+    const chain::transaction coinbase{ 1u, chain::inputs{ null }, chain::outputs{ chain::output{ 42u, chain::script{} } }, 0u };
+    const chain::header header{ 1u, test::genesis.hash(), null_hash, 1u, 2u, 3u };
+    const chain::block block{ header, { coinbase, tx } };
+    const auto stored = query.set(block, database::context{ 0, 1, 0 }, {}, false, true);
+    const auto link = query.to_header(block.hash());
+    const auto candidate = stored && query.push_candidate(link);
+    const auto confirmed = candidate && query.push_confirmed(link, true);
+    return confirmed ? link : header_link{};
+}
+
+BOOST_AUTO_TEST_CASE(query_batch_silent__get_silent_matches__confirmable__unconfirmed)
+{
+    database::settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    test::query_accessor query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    // Confirmable suffices, the tx is not pooled.
+    const auto genesis = test::genesis.transactions_ptr()->front()->hash(false);
+    const auto tx = to_spend(genesis, 42);
+    BOOST_REQUIRE(query.set(tx));
+    BOOST_REQUIRE(query.set_silent(query.to_tx(tx.hash(false)), simple_send()));
+
+    silent_matches out{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_silent_matches(out, cancel, get_keys(), 0, 1, 0, 0, false));
+    BOOST_REQUIRE_EQUAL(out.size(), 1u);
+    BOOST_REQUIRE_EQUAL(std::get<0>(out.front()), 0u);
+    BOOST_REQUIRE_EQUAL(std::get<1>(out.front()), tx.hash(false));
+    BOOST_REQUIRE_EQUAL(std::get<2>(out.front()), expected_point);
+    BOOST_REQUIRE(query.get_silent_matches(out, cancel, get_keys(), 0, 1, 0, max_size_t, true));
+    BOOST_REQUIRE_EQUAL(out.size(), 1u);
+    BOOST_REQUIRE_EQUAL(std::get<1>(out.front()), tx.hash(false));
+}
+
+BOOST_AUTO_TEST_CASE(query_batch_silent__get_silent_matches__conflicted__empty)
+{
+    database::settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    test::query_accessor query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const auto genesis = test::genesis.transactions_ptr()->front()->hash(false);
+    const auto conflicted = to_spend(genesis, 42);
+    BOOST_REQUIRE(query.set(conflicted));
+    BOOST_REQUIRE(query.set_silent(query.to_tx(conflicted.hash(false)), simple_send()));
+    BOOST_REQUIRE(!archive_confirm(query, to_spend(genesis, 41)).is_terminal());
+    BOOST_REQUIRE(!query.is_confirmable_tx(query.to_tx(conflicted.hash(false))));
+
+    silent_matches out{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_silent_matches(out, cancel, get_keys(), 0, 1, 0, 1, false));
+    BOOST_REQUIRE(out.empty());
+    BOOST_REQUIRE(query.get_silent_matches(out, cancel, get_keys(), 0, 1, 0, max_size_t, true));
+    BOOST_REQUIRE(out.empty());
+}
+
+BOOST_AUTO_TEST_CASE(query_batch_silent__get_silent_matches__conflicted_parent__empty)
+{
+    database::settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    test::query_accessor query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    const auto genesis = test::genesis.transactions_ptr()->front()->hash(false);
+    const auto parent = to_spend(genesis, 42);
+    const auto child = to_spend(parent.hash(false), 41);
+    BOOST_REQUIRE(query.set(parent));
+    BOOST_REQUIRE(query.set(child));
+    BOOST_REQUIRE(query.set_silent(query.to_tx(child.hash(false)), simple_send()));
+
+    // The child's own prevout is unspent, but its parent's is spent confirmed.
+    BOOST_REQUIRE(!archive_confirm(query, to_spend(genesis, 40)).is_terminal());
+    BOOST_REQUIRE(!query.is_confirmable_tx(query.to_tx(child.hash(false))));
+
+    silent_matches out{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_silent_matches(out, cancel, get_keys(), 0, 1, 0, 1, false));
+    BOOST_REQUIRE(out.empty());
+}
+
+BOOST_AUTO_TEST_CASE(query_batch_silent__get_silent_matches__double_spend__confirmed_only)
+{
+    database::settings settings{};
+    settings.path = TEST_DIRECTORY;
+    test::chunk_store store{ settings };
+    test::query_accessor query{ store };
+    BOOST_REQUIRE(!store.create(test::events_handler));
+    BOOST_REQUIRE(query.initialize(test::genesis));
+
+    // Both spends of genesis:0 match, only the confirmed one is reported.
+    const auto genesis = test::genesis.transactions_ptr()->front()->hash(false);
+    const auto conflicted = to_spend(genesis, 42);
+    const auto confirmed = to_spend(genesis, 41);
+    BOOST_REQUIRE(query.set(conflicted));
+    BOOST_REQUIRE(query.set_silent(query.to_tx(conflicted.hash(false)), simple_send()));
+    BOOST_REQUIRE(!archive_confirm(query, confirmed).is_terminal());
+    BOOST_REQUIRE(query.set_silent(query.to_tx(confirmed.hash(false)), simple_send()));
+
+    silent_matches out{};
+    const stopper cancel{};
+    BOOST_REQUIRE(query.get_silent_matches(out, cancel, get_keys(), 0, 2, 0, 1, false));
+    BOOST_REQUIRE_EQUAL(out.size(), 1u);
+    BOOST_REQUIRE_EQUAL(std::get<0>(out.front()), 1u);
+    BOOST_REQUIRE_EQUAL(std::get<1>(out.front()), confirmed.hash(false));
+}
+
 // get_silent_floor
 
 BOOST_AUTO_TEST_CASE(query_batch_silent__get_silent_floor__unmapped__zero)

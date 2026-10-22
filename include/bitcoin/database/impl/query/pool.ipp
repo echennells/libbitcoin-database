@@ -74,14 +74,8 @@ bool CLASS::is_confirmable_spent(const output_link& link) const NOEXCEPT
 TEMPLATE
 ins_link CLASS::find_confirmable_spender(const point& prevout) const NOEXCEPT
 {
-    for (const auto& in: to_spenders(prevout))
-    {
-        const auto tx = to_input_tx(in);
-        if (is_pooled(tx) && is_confirmable_tx(tx))
-            return in;
-    }
-
-    return {};
+    confirmables memo{};
+    return find_confirmable_spender(memo, prevout);
 }
 
 TEMPLATE
@@ -397,6 +391,20 @@ bool CLASS::is_confirmable_tx(confirmables& memo,
 }
 
 TEMPLATE
+ins_link CLASS::find_confirmable_spender(confirmables& memo,
+    const point& prevout) const NOEXCEPT
+{
+    for (const auto& in: to_spenders(prevout))
+    {
+        const auto tx = to_input_tx(in);
+        if (is_pooled(tx) && is_confirmable_tx(memo, tx))
+            return in;
+    }
+
+    return {};
+}
+
+TEMPLATE
 bool CLASS::get_confirmable_totals(fee_totals& out, const tx_link& link,
     bool ancestors) const NOEXCEPT
 {
@@ -414,6 +422,44 @@ bool CLASS::get_confirmable_totals(fee_totals& out, const tx_link& link,
         ++out.count;
         out.bytes = ceilinged_add(out.bytes, rate.bytes);
         out.fee = ceilinged_add(out.fee, rate.fee);
+    }
+
+    return true;
+}
+
+// The unconfirmed ancestry of the txs is evaluated in link order, so a walk
+// stops at a memoized parent (a pooled tx is archived after its parents). A
+// parent archived after its child (as by a block) costs only a longer walk.
+TEMPLATE
+bool CLASS::get_confirmables(const stopper& cancel, confirmables& out,
+    tx_links&& links) const NOEXCEPT
+{
+    std::unordered_set<tx_link::integer> ancestry{ links.begin(), links.end() };
+    while (!links.empty())
+    {
+        if (cancel)
+            return false;
+
+        const tx_link next{ links.back() };
+        links.pop_back();
+        for (const auto& point: to_points(next))
+        {
+            const auto parent = to_tx(get_point_key(point).hash());
+            if (!parent.is_terminal() && !is_confirmed_tx(parent) &&
+                ancestry.insert(parent.value).second)
+                links.push_back(parent.value);
+        }
+    }
+
+    links.assign(ancestry.begin(), ancestry.end());
+    std::sort(links.begin(), links.end());
+    out.clear();
+    for (const auto link: links)
+    {
+        if (cancel)
+            return false;
+
+        is_confirmable_tx(out, link);
     }
 
     return true;

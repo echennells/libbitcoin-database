@@ -294,6 +294,7 @@ public:
     /// Optional/configured table state.
     bool address_enabled() const NOEXCEPT;
     bool filter_enabled() const NOEXCEPT;
+    bool pool_enabled() const NOEXCEPT;
     bool silent_enabled() const NOEXCEPT;
     size_t silent_start_height() const NOEXCEPT;
     bool is_silent(const context& ctx) const NOEXCEPT;
@@ -562,7 +563,10 @@ public:
     bool populate_without_metadata(const transaction& tx) const NOEXCEPT;
 
     /// False implies missing prevouts, node input.metadata is populated.
-    /// Pool implies free tx, where any conflict implies is spent at height 0.
+    /// Pool implies free tx, where a pooled and confirmable conflict (any if no
+    /// pool table) implies spent at height 0, and an unconfirmed prevout must
+    /// be of a confirmable tx.
+    /// Confirmable skips an ancestor that is not stored (does not imply valid).
     bool populate_with_metadata(const input& input, bool chain=false,
         bool pool=false) const NOEXCEPT;
     bool populate_with_metadata(const block& block, bool chain=false) const NOEXCEPT;
@@ -822,7 +826,7 @@ public:
 
     /// Matches (height, tx hash, tweak) of rows [first, last) confirmed at
     /// heights (or mtps if time) [start, stop], ordered by height, then
-    /// unconfirmed (zero height), false implies cancel. A short height cut
+    /// confirmable (zero height), false implies cancel. A short height cut
     /// scanned from its floor scans only the rows of its confirmed blocks.
     bool get_silent_matches(silent_matches& out, const stopper& cancel,
         const system::scan::batch::receiver& keys, size_t first,
@@ -975,7 +979,9 @@ public:
     /// Address.
     /// -----------------------------------------------------------------------
 
-    /// Native queries (outpoints, deduped, arbitrary sort).
+    /// Native queries (outpoints, deduped, arbitrary sort). The outpoints of
+    /// get_unconfirmed_unspent_outpoints are pooled and confirmable, and not
+    /// spent by a pooled and confirmable tx.
     code get_unconfirmed_unspent_outpoints(const stopper& cancel,
         outpoints& out, const hash_digest& key,
         bool turbo=false) const NOEXCEPT;
@@ -986,7 +992,8 @@ public:
     code get_address_outpoints(const stopper& cancel, outpoints& out,
         const hash_digest& key, bool turbo=false) const NOEXCEPT;
 
-    /// Electrum queries (histories, deduped, electrum sort).
+    /// Electrum queries (histories, deduped, electrum sort), unconfirmed txs
+    /// only if pooled and confirmable.
     code get_unconfirmed_history(const stopper& cancel, histories& out,
         const hash_digest& key, size_t limit=max_size_t,
         bool turbo=false) const NOEXCEPT;
@@ -997,7 +1004,9 @@ public:
         histories& out, const hash_digest& key, size_t limit=max_size_t,
         bool turbo=false) const NOEXCEPT;
 
-    /// Electrum queries (unspent_outputs, deduped, electrum sort).
+    /// Electrum queries (unspent_outputs, deduped, electrum sort). The
+    /// unspent of get_unspent are confirmed, or pooled and confirmable, and
+    /// not spent by a confirmed, or pooled and confirmable, tx.
     code get_unconfirmed_unspent(const stopper& cancel, unspent_outputs& out,
         const hash_digest& key, bool turbo=false) const NOEXCEPT;
     code get_confirmed_unspent(const stopper& cancel, unspent_outputs& out,
@@ -1014,7 +1023,7 @@ public:
         uint64_t& unconfirmed, const hash_digest& key,
         bool turbo=false) const NOEXCEPT;
 
-    /// History queries.
+    /// History queries (unconfirmed only if pooled and confirmable).
     history get_tx_history(const tx_link& link, size_t start=zero,
         size_t end=max_size_t) const NOEXCEPT;
     history get_tx_confirmed_history(const tx_link& link, size_t start=zero,
@@ -1025,7 +1034,7 @@ public:
     histories get_spenders_history(const hash_digest& key,
         uint32_t index) const NOEXCEPT;
 
-    /// Unspent queries.
+    /// Unspent queries (get_tx_unspent unconfirmed only if pooled).
     unspent_output get_tx_unspent(const output_link& link) const NOEXCEPT;
     unspent_output get_tx_confirmed_unspent(const output_link& link) const NOEXCEPT;
     unspent_output get_tx_unconfirmed_unspent(const output_link& link) const NOEXCEPT;
@@ -1128,6 +1137,13 @@ protected:
     /// Confirmability memoized across the txs of a scan.
     bool is_confirmable_tx(confirmables& memo,
         const tx_link& link) const NOEXCEPT;
+    ins_link find_confirmable_spender(confirmables& memo,
+        const point& prevout) const NOEXCEPT;
+
+    /// Memoize confirmability of the txs and their unconfirmed ancestry in
+    /// link order, false implies cancel.
+    bool get_confirmables(const stopper& cancel, confirmables& out,
+        tx_links&& links) const NOEXCEPT;
 
     /// Confirmable ancestors or descendants of the tx (excluding the tx).
     tx_links to_confirmable_relatives(const tx_link& link,
@@ -1217,6 +1233,10 @@ protected:
     /// Bypasses and only asserts coinbase guard (internal use).
     bool populate_with_metadata_(const transaction& tx, bool chain,
         bool pool) const NOEXCEPT;
+
+    /// Population memoized across the inputs of a tx.
+    bool populate_with_metadata(confirmables& memo, const input& input,
+        bool chain, bool pool) const NOEXCEPT;
 
     /// Merkle
     /// -----------------------------------------------------------------------
@@ -1360,6 +1380,17 @@ protected:
         const tx_link& link) const NOEXCEPT;
     code get_address_txs(const stopper& cancel, tx_links& out,
         const hash_digest& key, size_t limit, bool turbo) const NOEXCEPT;
+
+    /// Remove unconfirmed txs that are not confirmable.
+    code filter_unconfirmable(const stopper& cancel,
+        histories& out) const NOEXCEPT;
+
+    /// Remove unconfirmed outputs that are not confirmable, and outputs spent
+    /// by a pooled and confirmable tx.
+    code filter_unconfirmable(const stopper& cancel, unspent_outputs& out,
+        bool turbo) const NOEXCEPT;
+    code filter_unconfirmable(const stopper& cancel,
+        outpoints& out) const NOEXCEPT;
 
 private:
     // This value should never be read, but may be useful in debugging.

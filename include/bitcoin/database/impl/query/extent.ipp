@@ -322,6 +322,12 @@ bool CLASS::filter_enabled() const NOEXCEPT
 }
 
 TEMPLATE
+bool CLASS::pool_enabled() const NOEXCEPT
+{
+    return store_.pool.enabled();
+}
+
+TEMPLATE
 bool CLASS::silent_enabled() const NOEXCEPT
 {
     return store_.get_envelope().silent_start_height != max_uint32;

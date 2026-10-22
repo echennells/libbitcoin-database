@@ -63,17 +63,47 @@ bool CLASS::populate_with_metadata_(const transaction& tx, bool chain,
 {
     BC_ASSERT(!tx.is_coinbase());
 
+    // Confirmability is memoized across the inputs. An unconfirmable parent
+    // ends population but an unconfirmable spender does not, so the pooled
+    // spenders are memoized (with their ancestry, in link order) beforehand.
+    confirmables memo{};
     const auto& ins = tx.inputs_ptr();
-    return std::all_of(ins->begin(), ins->end(),
-        [this, chain, pool](const auto& in) NOEXCEPT
+    if (chain && pool && pool_enabled())
+    {
+        tx_links spenders{};
+        for (const auto& in: *ins)
         {
-            return this->populate_with_metadata(*in, chain, pool);
+            if (in->prevout)
+                continue;
+
+            for (const auto& spender: to_spenders(in->point()))
+                if (const auto link = to_input_tx(spender); is_pooled(link))
+                    spenders.push_back(link.value);
+        }
+
+        const stopper cancel{};
+        get_confirmables(cancel, memo, std::move(spenders));
+    }
+
+    return std::all_of(ins->begin(), ins->end(),
+        [&](const auto& in) NOEXCEPT
+        {
+            return this->populate_with_metadata(memo, *in, chain, pool);
         });
 }
 
 TEMPLATE
 bool CLASS::populate_with_metadata(const input& input, bool chain,
     bool pool) const NOEXCEPT
+{
+    confirmables memo{};
+    return populate_with_metadata(memo, input, chain, pool);
+}
+
+// protected
+TEMPLATE
+bool CLASS::populate_with_metadata(confirmables& memo, const input& input,
+    bool chain, bool pool) const NOEXCEPT
 {
     // Null point would return nullptr and be interpreted as missing.
     BC_ASSERT(!input.point().is_null());
@@ -117,6 +147,10 @@ bool CLASS::populate_with_metadata(const input& input, bool chain,
             // Confirmed previous output not found.
             metadata.prevout_height = max_uint32;
             metadata.median_time_past = max_uint32;
+
+            // An unconfirmed previous output must be confirmable.
+            if (pool && input.prevout && !is_confirmable_tx(memo, tx))
+                input.prevout = {};
         }
 
         // The genesis coinbase is unspendable, so no confirmed spender is at
@@ -133,10 +167,16 @@ bool CLASS::populate_with_metadata(const input& input, bool chain,
             metadata.spender_height = system::possible_narrow_cast<uint32_t>(
                 height.value);
         }
+        else if (pool && (!pool_enabled() ||
+            !find_confirmable_spender(memo, input.point()).is_terminal()))
+        {
+            // Unconfirmed conflict found (any spender without a pool table).
+            metadata.spender_height = 0_u32;
+        }
         else
         {
-            // Confirmed spender not found.
-            metadata.spender_height = pool ? 0_u32 : max_uint32;
+            // Confirmed or pooled and confirmable spender not found.
+            metadata.spender_height = max_uint32;
         }
     }
 
